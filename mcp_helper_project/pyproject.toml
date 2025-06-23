@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "mcp-helper-service"
+version = "0.1.0"
+description = "一个独立的外部 Helper 服务，用于扩展 AIStudioProxyAPI 功能并支持 MCP 协议。"
+authors = ["Roo the AI Engineer"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.9,<4.0"
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.29.0"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
