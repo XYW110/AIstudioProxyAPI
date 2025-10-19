@@ -11,7 +11,16 @@ from typing import Optional, Any, Dict, Tuple
 from playwright.async_api import Page as AsyncPage, Browser as AsyncBrowser, BrowserContext as AsyncBrowserContext, Error as PlaywrightAsyncError, expect as expect_async
 
 # 导入配置和模型
-from config import *
+from config import (
+    AI_STUDIO_URL_PATTERN,
+    USER_INPUT_START_MARKER_SERVER,
+    USER_INPUT_END_MARKER_SERVER,
+    INPUT_SELECTOR,
+    AUTO_CONFIRM_LOGIN,
+    AUTO_SAVE_AUTH,
+    AUTH_SAVE_TIMEOUT,
+    SAVED_AUTH_DIR,
+)
 from models import ClientDisconnectedError
 
 logger = logging.getLogger("AIStudioProxyServer")
@@ -265,7 +274,7 @@ async def _initialize_page_logic(browser: AsyncBrowser):
     launch_mode = os.environ.get('LAUNCH_MODE', 'debug')
     logger.info(f"   检测到启动模式: {launch_mode}")
     loop = asyncio.get_running_loop()
-    
+
     if launch_mode == 'headless' or launch_mode == 'virtual_headless':
         auth_filename = os.environ.get('ACTIVE_AUTH_JSON_PATH')
         if auth_filename:
@@ -293,7 +302,7 @@ async def _initialize_page_logic(browser: AsyncBrowser):
         logger.info("   direct_debug_no_browser 模式：不加载 storage_state，不进行浏览器操作。")
     else:
         logger.warning(f"   ⚠️ 警告: 未知的启动模式 '{launch_mode}'。不加载 storage_state。")
-    
+
     try:
         logger.info("创建新的浏览器上下文...")
         context_options: Dict[str, Any] = {'viewport': {'width': 460, 'height': 800}}
@@ -302,7 +311,7 @@ async def _initialize_page_logic(browser: AsyncBrowser):
             logger.info(f"   (使用 storage_state='{os.path.basename(storage_state_path_to_use)}')")
         else:
             logger.info("   (不使用 storage_state)")
-        
+
         # 代理设置需要从server模块中获取
         import server
         if server.PLAYWRIGHT_PROXY_SETTINGS:
@@ -310,10 +319,10 @@ async def _initialize_page_logic(browser: AsyncBrowser):
             logger.info(f"   (浏览器上下文将使用代理: {server.PLAYWRIGHT_PROXY_SETTINGS['server']})")
         else:
             logger.info("   (浏览器上下文不使用显式代理配置)")
-        
+
         context_options['ignore_https_errors'] = True
         logger.info("   (浏览器上下文将忽略 HTTPS 错误)")
-        
+
         temp_context = await browser.new_context(**context_options)
 
         # 设置网络拦截和脚本注入
@@ -325,10 +334,10 @@ async def _initialize_page_logic(browser: AsyncBrowser):
         target_full_url = f"{target_url_base}prompts/new_chat"
         login_url_pattern = 'accounts.google.com'
         current_url = ""
-        
+
         # 导入_handle_model_list_response - 需要延迟导入避免循环引用
         from .operations import _handle_model_list_response
-        
+
         for p_iter in pages:
             try:
                 page_url_to_check = p_iter.url
@@ -346,7 +355,7 @@ async def _initialize_page_logic(browser: AsyncBrowser):
                 logger.warning(f"   检查页面 URL 时出现属性错误: {attr_err_url}")
             except Exception as e_url_check:
                 logger.warning(f"   检查页面 URL 时出现其他未预期错误: {e_url_check} (类型: {type(e_url_check).__name__})")
-        
+
         if not found_page:
             logger.info(f"-> 未找到合适的现有页面，正在打开新页面并导航到 {target_full_url}...")
             found_page = await temp_context.new_page()
@@ -374,7 +383,7 @@ async def _initialize_page_logic(browser: AsyncBrowser):
                     logger.error("     5. 系统资源问题: 确保系统有足够的内存和 CPU 资源。")
                     logger.error("="*74 + "\n")
                 raise RuntimeError(f"导航新页面失败: {new_page_nav_err}") from new_page_nav_err
-        
+
         if login_url_pattern in current_url:
             if launch_mode == 'headless':
                 logger.error("无头模式下检测到重定向至登录页面，认证可能已失效。请更新认证文件。")
@@ -382,10 +391,14 @@ async def _initialize_page_logic(browser: AsyncBrowser):
             else:
                 print(f"\n{'='*20} 需要操作 {'='*20}", flush=True)
                 login_prompt = "   检测到可能需要登录。如果浏览器显示登录页面，请在浏览器窗口中完成 Google 登录，然后在此处按 Enter 键继续..."
-                print(USER_INPUT_START_MARKER_SERVER, flush=True)
-                await loop.run_in_executor(None, input, login_prompt)
-                print(USER_INPUT_END_MARKER_SERVER, flush=True)
-                logger.info("   用户已操作，正在检查登录状态...")
+                # NEW: If SUPPRESS_LOGIN_WAIT is set, skip waiting for user input.
+                if os.environ.get("SUPPRESS_LOGIN_WAIT", "").lower() in ("1", "true", "yes"):
+                    logger.info("检测到 SUPPRESS_LOGIN_WAIT 标志，跳过等待用户输入。")
+                else:
+                    print(USER_INPUT_START_MARKER_SERVER, flush=True)
+                    await loop.run_in_executor(None, input, login_prompt)
+                    print(USER_INPUT_END_MARKER_SERVER, flush=True)
+                logger.info("   正在检查登录状态...")
                 try:
                     await found_page.wait_for_url(f"**/{AI_STUDIO_URL_PATTERN}**", timeout=180000)
                     current_url = found_page.url
@@ -394,36 +407,39 @@ async def _initialize_page_logic(browser: AsyncBrowser):
                         raise RuntimeError("手动登录尝试后仍在登录页面。")
                     logger.info("   ✅ 登录成功！请不要操作浏览器窗口，等待后续提示。")
 
-                    # 等待模型列表响应，确认登录成功
-                    await _wait_for_model_list_and_handle_auth_save(temp_context, launch_mode, loop)
+                    # 登录成功后，调用认证保存逻辑
+                    if os.environ.get('AUTO_SAVE_AUTH', 'false').lower() == 'true':
+                        await _wait_for_model_list_and_handle_auth_save(temp_context, launch_mode, loop)
+
                 except Exception as wait_login_err:
                     from .operations import save_error_snapshot
                     await save_error_snapshot("init_login_wait_fail")
                     logger.error(f"登录提示后未能检测到 AI Studio URL 或保存状态时出错: {wait_login_err}", exc_info=True)
                     raise RuntimeError(f"登录提示后未能检测到 AI Studio URL: {wait_login_err}") from wait_login_err
+
         elif target_url_base not in current_url or "/prompts/" not in current_url:
             from .operations import save_error_snapshot
             await save_error_snapshot("init_unexpected_page")
             logger.error(f"初始导航后页面 URL 意外: {current_url}。期望包含 '{target_url_base}' 和 '/prompts/'。")
             raise RuntimeError(f"初始导航后出现意外页面: {current_url}。")
-        
+
         logger.info(f"-> 确认当前位于 AI Studio 对话页面: {current_url}")
         await found_page.bring_to_front()
-        
+
         try:
             input_wrapper_locator = found_page.locator('ms-prompt-input-wrapper')
             await expect_async(input_wrapper_locator).to_be_visible(timeout=35000)
             await expect_async(found_page.locator(INPUT_SELECTOR)).to_be_visible(timeout=10000)
             logger.info("-> ✅ 核心输入区域可见。")
             
-            model_name_locator = found_page.locator('mat-select[data-test-ms-model-selector] div.model-option-content span.gmat-body-medium')
+            model_name_locator = found_page.locator('[data-test-id="model-name"]')
             try:
                 model_name_on_page = await model_name_locator.first.inner_text(timeout=5000)
                 logger.info(f"-> 🤖 页面检测到的当前模型: {model_name_on_page}")
             except PlaywrightAsyncError as e:
                 logger.error(f"获取模型名称时出错 (model_name_locator): {e}")
                 raise
-            
+
             result_page_instance = found_page
             result_page_ready = True
 
@@ -504,6 +520,19 @@ async def _wait_for_model_list_and_handle_auth_save(temp_context, launch_mode, l
     except asyncio.TimeoutError:
         logger.warning("   ⚠️ 等待模型列表响应超时，但继续处理认证保存...")
 
+    # 检查是否有预设的文件名用于保存
+    save_auth_filename = os.environ.get('SAVE_AUTH_FILENAME', '').strip()
+    if save_auth_filename:
+        logger.info(f"   检测到 SAVE_AUTH_FILENAME 环境变量: '{save_auth_filename}'。将自动保存认证文件。")
+        await _handle_auth_file_save_with_filename(temp_context, save_auth_filename)
+        return
+
+    # If not auto-saving, proceed with interactive prompts
+    await _interactive_auth_save(temp_context, launch_mode, loop)
+
+
+async def _interactive_auth_save(temp_context, launch_mode, loop):
+    """处理认证文件保存的交互式提示"""
     # 检查是否启用自动确认
     if AUTO_CONFIRM_LOGIN:
         print("\n" + "="*50, flush=True)
@@ -562,7 +591,6 @@ async def _handle_auth_file_save(temp_context, loop):
     finally:
         print(USER_INPUT_END_MARKER_SERVER, flush=True)
 
-    # 检查用户是否选择取消
     if chosen_auth_filename.strip().lower() == 'cancel':
         print("   用户选择取消保存认证状态。", flush=True)
         return
@@ -575,10 +603,31 @@ async def _handle_auth_file_save(temp_context, loop):
 
     try:
         await temp_context.storage_state(path=auth_save_path)
+        logger.info(f"   认证状态已成功保存到: {auth_save_path}")
         print(f"   ✅ 认证状态已成功保存到: {auth_save_path}", flush=True)
     except Exception as save_state_err:
         logger.error(f"   ❌ 保存认证状态失败: {save_state_err}", exc_info=True)
         print(f"   ❌ 保存认证状态失败: {save_state_err}", flush=True)
+
+
+async def _handle_auth_file_save_with_filename(temp_context, filename: str):
+    """处理认证文件保存（使用提供的文件名）"""
+    os.makedirs(SAVED_AUTH_DIR, exist_ok=True)
+
+    # Clean the filename and add .json if needed
+    final_auth_filename = filename.strip()
+    if not final_auth_filename.endswith(".json"):
+        final_auth_filename += ".json"
+
+    auth_save_path = os.path.join(SAVED_AUTH_DIR, final_auth_filename)
+
+    try:
+        await temp_context.storage_state(path=auth_save_path)
+        print(f"   ✅ 认证状态已自动保存到: {auth_save_path}", flush=True)
+        logger.info(f"   自动保存认证状态成功: {auth_save_path}")
+    except Exception as save_state_err:
+        logger.error(f"   ❌ 自动保存认证状态失败: {save_state_err}", exc_info=True)
+        print(f"   ❌ 自动保存认证状态失败: {save_state_err}", flush=True)
 
 
 async def _handle_auth_file_save_auto(temp_context):
@@ -592,8 +641,38 @@ async def _handle_auth_file_save_auto(temp_context):
 
     try:
         await temp_context.storage_state(path=auth_save_path)
-        print(f"   ✅ 认证状态已自动保存到: {auth_save_path}", flush=True)
-        logger.info(f"   自动保存认证状态成功: {auth_save_path}")
+        logger.info(f"   认证状态已成功保存到: {auth_save_path}")
+        print(f"   ✅ 认证状态已成功保存到: {auth_save_path}", flush=True)
     except Exception as save_state_err:
         logger.error(f"   ❌ 自动保存认证状态失败: {save_state_err}", exc_info=True)
         print(f"   ❌ 自动保存认证状态失败: {save_state_err}", flush=True)
+
+async def enable_temporary_chat_mode(page: AsyncPage):
+    """
+    检查并启用 AI Studio 界面的“临时聊天”模式。
+    这是一个独立的UI操作，应该在页面完全稳定后调用。
+    """
+    try:
+        logger.info("-> (UI Op) 正在检查并启用 '临时聊天' 模式...")
+        
+        incognito_button_locator = page.locator('button[aria-label="Temporary chat toggle"]')
+        
+        await incognito_button_locator.wait_for(state="visible", timeout=10000)
+        
+        button_classes = await incognito_button_locator.get_attribute("class")
+        
+        if button_classes and 'ms-button-active' in button_classes:
+            logger.info("-> (UI Op) '临时聊天' 模式已激活。")
+        else:
+            logger.info("-> (UI Op) '临时聊天' 模式未激活，正在点击...")
+            await incognito_button_locator.click(timeout=5000, force=True)
+            await asyncio.sleep(1)
+            
+            updated_classes = await incognito_button_locator.get_attribute("class")
+            if updated_classes and 'ms-button-active' in updated_classes:
+                logger.info("✅ (UI Op) '临时聊天' 模式已成功启用。")
+            else:
+                logger.warning("⚠️ (UI Op) 点击后 '临时聊天' 模式状态验证失败。")
+
+    except Exception as e:
+        logger.warning(f"⚠️ (UI Op) 启用 '临时聊天' 模式时出错: {e}")
